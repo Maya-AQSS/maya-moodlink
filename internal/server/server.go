@@ -11,26 +11,28 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
-	"maya-moodle-gateway/internal/moodle"
-	"maya-moodle-gateway/internal/tokens"
+	"maya-moodlink/internal/moodle"
+	"maya-moodlink/internal/session"
+	"maya-moodlink/internal/tokens"
 )
 
-// userHeader identifica de momento al usuario que hace la petición.
+// userHeader lleva el id del usuario de Odoo (res.users.id) en nombre del cual se opera.
 //
-// ATENCIÓN: es un marcador provisional. Cualquiera que llegue al servicio puede poner
-// esta cabecera y suplantar a otro usuario. Antes de exponer el servicio hay que
-// sustituirlo por autenticación real (JWT / mTLS) y añadir la autorización por aula.
+// ATENCIÓN: la autenticación actual es una clave de servicio compartida (API_KEY). Quien la
+// tenga puede actuar como cualquier usuario. Es válido mientras el único llamante sea Odoo,
+// en red de confianza; la autorización por operación y aula irá a continuación.
 const userHeader = "X-Maya-User"
 
 type Deps struct {
 	Log            *slog.Logger
 	Moodle         *moodle.Client
-	Tokens         *tokens.Manager
-	MoodleService  string
-	AdminAPIKey    string
+	Auth           *session.Authenticator
+	APIKey         string
+	DBPing         func(ctx context.Context) error // nil si no hay base de datos (tests)
 	RequestTimeout time.Duration
 }
 
@@ -39,7 +41,7 @@ type Server struct {
 	ready struct {
 		mu        sync.Mutex
 		checkedAt time.Time
-		ok        bool
+		failing   []string
 	}
 }
 
@@ -56,46 +58,52 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
-	//mux.HandleFunc("GET /v1/courses/{courseID}/students", s.withUser(s.handleStudents))
-
-	mux.HandleFunc("GET /v1/admin/users/{user}/token", s.withAdmin(s.handleTokenStatus))
-	mux.HandleFunc("PUT /v1/admin/users/{user}/token", s.withAdmin(s.handleTokenPut))
-	mux.HandleFunc("POST /v1/admin/users/{user}/token/login", s.withAdmin(s.handleTokenLogin))
-	mux.HandleFunc("DELETE /v1/admin/users/{user}/token", s.withAdmin(s.handleTokenDelete))
+	// mux.HandleFunc("GET /v1/courses/{courseID}/students", s.auth(s.withUser(s.handleStudents)))
+	mux.HandleFunc("POST /v1/users/{user}/token", s.auth(s.withPathUser(s.handleTokenRequest)))
 
 	return s.logging(s.recoverer(mux))
 }
 
 // ---------------------------------------------------------------- health
 
-// handleHealthz: liveness. Solo indica que el proceso responde; no depende de Moodle.
+// handleHealthz: liveness. Solo indica que el proceso responde; no depende de nada externo.
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleReadyz: readiness. Comprueba que Moodle es alcanzable (resultado cacheado 10 s
-// para que un sondeo frecuente no genere tráfico hacia Moodle).
+// handleReadyz: readiness. Comprueba que Moodle y la base de datos de Odoo responden.
+// El resultado se cachea 10 s para que un sondeo frecuente no genere tráfico.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	if !s.moodleReachable(r.Context()) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "moodle_unreachable"})
+	if failing := s.failingDeps(r.Context()); len(failing) > 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "failing": failing})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-func (s *Server) moodleReachable(ctx context.Context) bool {
+func (s *Server) failingDeps(ctx context.Context) []string {
 	s.ready.mu.Lock()
 	defer s.ready.mu.Unlock()
 	if !s.ready.checkedAt.IsZero() && time.Since(s.ready.checkedAt) < 10*time.Second {
-		return s.ready.ok
+		return s.ready.failing
 	}
-	err := s.Moodle.Ping(ctx)
-	s.ready.checkedAt = time.Now()
-	s.ready.ok = err == nil
-	if err != nil {
+
+	var failing []string
+	if err := s.Moodle.Ping(ctx); err != nil {
+		failing = append(failing, "moodle")
 		s.Log.Warn("moodle no alcanzable", "error", err)
 	}
-	return s.ready.ok
+	if s.DBPing != nil {
+		dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if err := s.DBPing(dctx); err != nil {
+			failing = append(failing, "database")
+			s.Log.Warn("base de datos de odoo no alcanzable", "error", err)
+		}
+	}
+	s.ready.checkedAt = time.Now()
+	s.ready.failing = failing
+	return failing
 }
 
 // ---------------------------------------------------------------- middlewares
@@ -117,7 +125,8 @@ func newRequestID() string {
 }
 
 // logging asigna un id a la petición, impone el timeout global y registra una línea por
-// petición. No registra query string, cuerpos ni cabeceras de autorización.
+// petición. No registra query string, cuerpos ni cabeceras de autorización: por el
+// endpoint de token pasan contraseñas.
 func (s *Server) logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -155,7 +164,31 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 	})
 }
 
-// withUser exige la cabecera de identidad (provisional, ver userHeader).
+// auth exige la clave de servicio (Authorization: Bearer API_KEY), comparada en tiempo
+// constante. Sin clave configurada falla cerrado.
+func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.APIKey == "" {
+			writeError(w, http.StatusServiceUnavailable, "api_key_not_configured", "API_KEY no está configurada")
+			return
+		}
+		const prefix = "Bearer "
+		h := r.Header.Get("Authorization")
+		if len(h) <= len(prefix) || h[:len(prefix)] != prefix {
+			writeError(w, http.StatusUnauthorized, "unauthenticated", "se requiere Authorization: Bearer")
+			return
+		}
+		got := sha256.Sum256([]byte(h[len(prefix):]))
+		want := sha256.Sum256([]byte(s.APIKey))
+		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+			writeError(w, http.StatusUnauthorized, "unauthenticated", "credencial incorrecta")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// withUser exige la cabecera X-Maya-User con el id del usuario de Odoo.
 func (s *Server) withUser(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !validUser(r.Header.Get(userHeader)) {
@@ -166,62 +199,37 @@ func (s *Server) withUser(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// withAdmin protege los endpoints /v1/admin/* con un Bearer estático (comparación en
-// tiempo constante) y valida el {user} de la ruta.
-func (s *Server) withAdmin(next http.HandlerFunc) http.HandlerFunc {
+// withPathUser valida el {user} de la ruta.
+func (s *Server) withPathUser(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.AdminAPIKey == "" {
-			writeError(w, http.StatusServiceUnavailable, "admin_disabled", "ADMIN_API_KEY no está configurada")
-			return
-		}
-		const prefix = "Bearer "
-		h := r.Header.Get("Authorization")
-		if len(h) <= len(prefix) || h[:len(prefix)] != prefix {
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "se requiere Authorization: Bearer")
-			return
-		}
-		got := sha256.Sum256([]byte(h[len(prefix):]))
-		want := sha256.Sum256([]byte(s.AdminAPIKey))
-		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "credencial de administración incorrecta")
-			return
-		}
 		if !validUser(r.PathValue("user")) {
-			writeError(w, http.StatusBadRequest, "invalid_user", "identificador de usuario no válido")
+			writeError(w, http.StatusBadRequest, "invalid_user", "el usuario debe ser el id numérico de Odoo")
 			return
 		}
 		next(w, r)
 	}
 }
 
-// validUser limita los identificadores a un alfabeto seguro (se usan como clave y en logs).
+// validUser: el usuario es el id de res.users de Odoo, en forma canónica ("7", no "007").
 func validUser(u string) bool {
-	if u == "" || len(u) > 128 {
-		return false
-	}
-	for _, c := range u {
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '.', c == '_', c == '-', c == '@':
-		default:
-			return false
-		}
-	}
-	return true
+	id, err := strconv.ParseInt(u, 10, 64)
+	return err == nil && id > 0 && strconv.FormatInt(id, 10) == u
 }
 
 // ---------------------------------------------------------------- respuestas
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
 type errorBody struct {
 	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
+		Code       string `json:"code"`
+		Message    string `json:"message"`
+		MoodleCode string `json:"moodle_code,omitempty"`
 	} `json:"error"`
 }
 
@@ -232,33 +240,58 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, b)
 }
 
-// writeUpstreamError traduce los errores del Manager de tokens y del cliente Moodle a
-// respuestas HTTP coherentes.
+func writeMoodleError(w http.ResponseWriter, status int, code string, me *moodle.Error) {
+	var b errorBody
+	b.Error.Code = code
+	b.Error.Message = me.Message
+	b.Error.MoodleCode = me.Code
+	writeJSON(w, status, b)
+}
+
+// writeUpstreamError traduce los errores de la sesión y del cliente Moodle a HTTP.
+//
+// La distinción importante para quien llama (Odoo):
+//
+//	401 moodle_token_missing / moodle_token_invalid  -> el usuario debe (re)introducir su contraseña
+//	403 moodle_forbidden                              -> Moodle le niega el permiso: reautenticarse NO lo arregla
+//	403 user_inactive                                 -> el usuario no existe o está archivado
 func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, tokens.ErrNoToken):
-		writeError(w, http.StatusUnauthorized, "moodle_token_missing", "el usuario no tiene token de Moodle registrado")
-	case errors.Is(err, tokens.ErrTokenInvalid), errors.Is(err, moodle.ErrInvalidToken):
-		writeError(w, http.StatusUnauthorized, "moodle_token_invalid", "el token de Moodle del usuario no es válido o ha caducado; debe renovarse")
+	case errors.Is(err, session.ErrNoToken):
+		writeError(w, http.StatusUnauthorized, "moodle_token_missing", "el usuario aún no se ha identificado en Moodle")
+	case errors.Is(err, moodle.ErrInvalidToken):
+		writeError(w, http.StatusUnauthorized, "moodle_token_invalid", "el token de Moodle del usuario no es válido; debe volver a identificarse")
+	case errors.Is(err, tokens.ErrDecrypt):
+		// No debería pasar salvo clave retirada o fila manipulada. Para el usuario es
+		// recuperable (al identificarse de nuevo se sobrescribe), pero operaciones debe verlo.
+		s.Log.Error("no se pudo descifrar un token guardado", "error", err)
+		writeError(w, http.StatusUnauthorized, "moodle_token_invalid", "el token guardado no es utilizable; debe volver a identificarse")
+	case errors.Is(err, session.ErrUserInactive):
+		writeError(w, http.StatusForbidden, "user_inactive", "el usuario no existe o está archivado")
 	case errors.Is(err, moodle.ErrOverloaded):
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "overloaded", "demasiadas peticiones hacia Moodle; reintente en unos instantes")
 	case errors.Is(err, context.Canceled):
 		writeError(w, 499, "client_closed_request", "el cliente cerró la conexión")
 	case errors.Is(err, context.DeadlineExceeded):
-		writeError(w, http.StatusGatewayTimeout, "upstream_timeout", "Moodle no respondió a tiempo")
+		writeError(w, http.StatusGatewayTimeout, "upstream_timeout", "Moodle o la base de datos no respondieron a tiempo")
 	case errors.Is(err, moodle.ErrUnavailable):
 		writeError(w, http.StatusBadGateway, "moodle_unavailable", "Moodle no está disponible")
+	case errors.Is(err, session.ErrServiceAccount):
+		// Problema de configuración (contraseña caducada, usuario mal puesto...): no es culpa
+		// del usuario final ni se arregla pidiéndole nada.
+		s.Log.Error("fallo con una cuenta de servicio de Moodle", "error", err)
+		writeError(w, http.StatusBadGateway, "service_account_failed", "no se pudo autenticar la cuenta de servicio en Moodle")
 	default:
 		var me *moodle.Error
 		if errors.As(err, &me) {
 			switch me.Code {
 			case "invalidrecord", "invalidcourseid":
-				writeError(w, http.StatusNotFound, "not_found", me.Message)
+				writeMoodleError(w, http.StatusNotFound, "not_found", me)
 			case "nopermissions", "accessexception", "requireloginerror":
-				writeError(w, http.StatusForbidden, "moodle_forbidden", me.Message)
+				writeMoodleError(w, http.StatusForbidden, "moodle_forbidden", me)
 			default:
-				writeError(w, http.StatusBadGateway, "moodle_error", me.Message+" ("+me.Code+")")
+				writeMoodleError(w, http.StatusBadGateway, "moodle_error", me)
 			}
 			return
 		}

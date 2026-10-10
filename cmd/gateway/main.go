@@ -121,7 +121,7 @@ func run() error {
 		Moodle:         mc,
 		Auth:           auth,
 		APIKey:         cfg.APIKey,
-		MoodleService:  cfg.MoodleService,
+		DBPing:         store.Ping,
 		RequestTimeout: cfg.RequestTimeout,
 	})
 
