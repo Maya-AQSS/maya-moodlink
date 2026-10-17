@@ -60,6 +60,7 @@ func New(d Deps) http.Handler {
 
 	// mux.HandleFunc("GET /v1/courses/{courseID}/students", s.auth(s.withUser(s.handleStudents)))
 	mux.HandleFunc("POST /v1/users/{user}/token", s.auth(s.withPathUser(s.handleTokenRequest)))
+	mux.HandleFunc("GET /v1/assignments/{assignmentID}/submissions", s.auth(s.withUser(s.handleSubmissions)))
 
 	return s.logging(s.recoverer(mux))
 }
