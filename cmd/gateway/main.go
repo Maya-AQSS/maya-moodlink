@@ -123,6 +123,8 @@ func run() error {
 		APIKey:         cfg.APIKey,
 		DBPing:         store.Ping,
 		RequestTimeout: cfg.RequestTimeout,
+
+		MaxDownloadBytes: int64(cfg.MaxDownloadMB) << 20,
 	})
 
 	// Instanciación del servidor HTTP configurando timeouts explícitos por seguridad

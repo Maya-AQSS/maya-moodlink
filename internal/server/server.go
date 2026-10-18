@@ -34,6 +34,8 @@ type Deps struct {
 	APIKey         string
 	DBPing         func(ctx context.Context) error // nil si no hay base de datos (tests)
 	RequestTimeout time.Duration
+	// MaxDownloadBytes limita el tamaño de los ficheros que se descargan de Moodle (0 = 50 MiB)
+	MaxDownloadBytes int64
 }
 
 type Server struct {
@@ -61,6 +63,7 @@ func New(d Deps) http.Handler {
 	// mux.HandleFunc("GET /v1/courses/{courseID}/students", s.auth(s.withUser(s.handleStudents)))
 	mux.HandleFunc("POST /v1/users/{user}/token", s.auth(s.withPathUser(s.handleTokenRequest)))
 	mux.HandleFunc("GET /v1/assignments/{assignmentID}/submissions", s.auth(s.withUser(s.handleSubmissions)))
+	mux.HandleFunc("POST /v1/files/download", s.auth(s.withUser(s.handleDownload)))
 
 	return s.logging(s.recoverer(mux))
 }
@@ -287,7 +290,7 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 		var me *moodle.Error
 		if errors.As(err, &me) {
 			switch me.Code {
-			case "invalidrecord", "invalidcourseid":
+			case "invalidrecord", "invalidcourseid", "filenotfound":
 				writeMoodleError(w, http.StatusNotFound, "not_found", me)
 			case "nopermissions", "accessexception", "requireloginerror":
 				writeMoodleError(w, http.StatusForbidden, "moodle_forbidden", me)

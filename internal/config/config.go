@@ -28,6 +28,7 @@ type Config struct {
 	OdooMaxConns   int
 	TokenKeys      []tokens.Key
 	LogLevel       string // Nivel de detalle de los logs ("debug", "info", "warn")
+	MaxDownloadMB  int    // Tamaño máximo (MiB) de los ficheros que se descargan de Moodle
 
 	// Fichero con las contraseñas de las cuentas de servicio (administradores). Esta informacion debe acabar en el vault
 	ServiceCredentialsFile string
@@ -56,6 +57,7 @@ func Load() (Config, error) {
 	c.OdooMaxConns = envInt("ODOO_DB_MAX_CONNS", 10, &errs)
 	c.AttemptTimeout = envDuration("MOODLE_ATTEMPT_TIMEOUT", 15*time.Second, &errs)
 	c.RequestTimeout = envDuration("REQUEST_TIMEOUT", 30*time.Second, &errs)
+	c.MaxDownloadMB = envInt("MAX_DOWNLOAD_MB", 50, &errs)
 
 	if c.MoodleURL == "" {
 		errs = append(errs, errors.New("MOODLE_URL es obligatoria"))
@@ -70,6 +72,9 @@ func Load() (Config, error) {
 	}
 	if c.MaxRetries < 0 {
 		errs = append(errs, errors.New("MOODLE_MAX_RETRIES debe ser >= 0"))
+	}
+	if c.MaxDownloadMB < 1 {
+		errs = append(errs, errors.New("MAX_DOWNLOAD_MB debe ser >= 1"))
 	}
 	if c.OdooMaxConns < 1 {
 		errs = append(errs, errors.New("ODOO_DB_MAX_CONNS debe ser >= 1"))
