@@ -31,3 +31,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Secretos montados en contenedores (compose.yaml); solo se versionan los ejemplos
+secrets/*
+!secrets/*.example.json

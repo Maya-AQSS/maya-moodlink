@@ -1,0 +1,18 @@
+# Nunca meter secretos en el contexto de construcción
+.env
+*.env
+!.env.example
+secrets/
+
+.git
+.gitignore
+*.md
+LICENSE
+Dockerfile
+.dockerignore
+compose*.yaml
+sql/
+
+*.test
+*.out
+coverage.*

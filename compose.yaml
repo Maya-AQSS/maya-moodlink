@@ -1,0 +1,64 @@
+# Entorno de DESARROLLO: gateway + un Postgres desechable que imita la res_users de Odoo.
+#   docker compose up --build
+#   curl localhost:8080/healthz
+#
+# Los valores salen del .env (Compose lo lee solo para interpolar ${...}); si no existe,
+# se usan los valores por defecto de abajo, que son SOLO para desarrollo.
+# ODOO_DB_DSN y SERVICE_CREDENTIALS_FILE no se toman del .env porque allí apuntan a rutas
+# y hosts del sistema, no del contenedor.
+
+services:
+  gateway:
+    build: .
+    image: maya-moodlink:dev
+    ports:
+      - "${GATEWAY_PORT:-18380}:18380"
+    environment:
+      MOODLE_URL: ${MOODLE_URL:-https://moodle.example.org}
+      API_KEY: ${API_KEY:-dev-api-key-fea25488482d64930d9a}
+      TOKEN_ENC_KEYS: ${TOKEN_ENC_KEYS:-dev:tCcTl1hYYJ548xMpR2JjaYkkNoLeqrbAIuJMpTwv47I=}
+      ODOO_DB_DSN: postgres://moodle_gateway:moodle_gateway@db:5432/odoo?sslmode=disable
+      ODOO_DB_MAX_CONNS: ${ODOO_DB_MAX_CONNS:-10}
+      SERVICE_CREDENTIALS_FILE: ""
+      LISTEN_ADDR: ":18380"
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-30s}
+      MAX_DOWNLOAD_MB: ${MAX_DOWNLOAD_MB:-50}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MOODLE_MAX_CONCURRENCY: ${MOODLE_MAX_CONCURRENCY:-30}
+      MOODLE_ATTEMPT_TIMEOUT: ${MOODLE_ATTEMPT_TIMEOUT:-15s}
+      MOODLE_MAX_RETRIES: ${MOODLE_MAX_RETRIES:-2}
+      MOODLE_SERVICE: ${MOODLE_SERVICE:-moodle_mobile_app}
+    # Para probar cuentas de servicio: pon SERVICE_CREDENTIALS_FILE=/run/secrets/service_credentials
+    # arriba y descomenta esto (el fichero ./secrets/ está fuera del repositorio y de la imagen).
+    # secrets:
+    #   - service_credentials
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+      POSTGRES_DB: odoo
+      GATEWAY_DB_PASSWORD: moodle_gateway
+    volumes:
+      - ./sql/grants.sql:/sql/grants.sql:ro
+      - ./sql/dev:/docker-entrypoint-initdb.d:ro
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo -d odoo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  db-data:
+
+# secrets:
+#   service_credentials:
+#     file: ./secrets/service_credentials.json

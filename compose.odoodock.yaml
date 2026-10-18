@@ -1,0 +1,36 @@
+# Override: conecta el gateway a la BD del Odoo de odoodock (contenedor odoodock-db-1, BD odoo_db)
+# en lugar del Postgres de desarrollo de compose.yaml.
+#   docker compose -f compose.yaml -f compose.odoodock.yaml up --build gateway
+# (se nombra "gateway" para que no arranque el servicio db de compose.yaml).
+#
+# Requisitos (una vez):
+#   1. Rol de solo lectura en odoo_db:
+#        docker exec -i odoodock-db-1 psql -U odoodock -d odoo_db -v gateway_password='...' -f - < sql/grants.sql
+#   2. Esa misma contraseña en el .env: ODOODOCK_DB_PASSWORD=...
+#   3. Contraseñas de las cuentas de servicio en secrets/service_credentials.json
+#      (copia de secrets/service_credentials.example.json; fuera de git y de la imagen).
+
+services:
+  gateway:
+    environment:
+      # Por nombre de contenedor: el alias "db" de esa red chocaría con el servicio db de compose.yaml.
+      # odoodock-db-1 no tiene SSL activado.
+      ODOO_DB_DSN: postgres://moodle_gateway:${ODOODOCK_DB_PASSWORD}@odoodock-db-1:5432/odoo_db?sslmode=disable
+      # Solo la RUTA: el fichero llega al contenedor por el secret de abajo.
+      SERVICE_CREDENTIALS_FILE: /run/secrets/service_credentials
+    secrets:
+      - service_credentials
+    depends_on: !reset {}
+    networks:
+      - default
+      - odoodock
+
+networks:
+  odoodock:
+    name: traefik_network
+    external: true
+
+secrets:
+  # Se monta en solo lectura en /run/secrets/service_credentials.
+  service_credentials:
+    file: ./secrets/service_credentials.json
