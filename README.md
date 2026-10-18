@@ -34,6 +34,8 @@ Objetivos del diseño:
   | `mod_assign_get_submissions`    | `GET /v1/assignments/{id}/submissions`       |
   | `core_user_get_users_by_field`  | `GET /v1/assignments/{id}/submissions`       |
 
+  Además, para `POST /v1/files/download` el servicio tiene que tener activada la opción **Puede descargar ficheros** (*downloadfiles*; `moodle_mobile_app` la tiene). Si no, Moodle responde con `accessexception` y el gateway devuelve **403**.
+
   Al añadir un endpoint nuevo hay que comprobar que su función está en el servicio. Si no lo está, Moodle responde con `accessexception` y el gateway devuelve **403**.
 - Los usuarios (profesores y cuentas de servicio) necesitan en Moodle los permisos de la operación que hagan. Por ejemplo, para listar las entregas de una tarea, permiso para calificarla en ese curso.
 
@@ -42,10 +44,10 @@ Objetivos del diseño:
 El gateway se conecta a la base de datos de Odoo con un rol propio, de **solo lectura** y limitado a las columnas que necesita:
 
 ```sql
-CREATE ROLE maya_gateway LOGIN PASSWORD '...';
-GRANT CONNECT ON DATABASE odoo TO maya_gateway;
-GRANT USAGE ON SCHEMA public TO maya_gateway;
-GRANT SELECT (id, active, moodle_username, moodle_token_enc) ON res_users TO maya_gateway;
+CREATE ROLE moodle_gateway LOGIN PASSWORD '...';
+GRANT CONNECT ON DATABASE odoo TO moodle_gateway;
+GRANT USAGE ON SCHEMA public TO moodle_gateway;
+GRANT SELECT (id, active, moodle_username, moodle_token_enc) ON res_users TO moodle_gateway;
 ```
 
 Así el gateway no puede leer los hashes de contraseña ni ninguna otra columna. Las consultas nombran las columnas una a una: un `SELECT *` fallaría por falta de permisos, y está hecho a propósito. Las columnas `moodle_username` y `moodle_token_enc` las crea el addon `maya_moodle`.
@@ -69,7 +71,8 @@ Se configura solo con variables de entorno (ver `.env.example`). `config.Load` v
 | `SERVICE_CREDENTIALS_FILE` | no | Fichero JSON con las contraseñas de las cuentas de servicio. Vacío significa que no hay ninguna. |
 | `MOODLE_SERVICE`           | no | *Shortname* del servicio web (`moodle_mobile_app`). |
 | `LISTEN_ADDR`              | no | `:8080` |
-| `REQUEST_TIMEOUT`          | no | Tiempo máximo de cada petición (`30s`). |
+| `REQUEST_TIMEOUT`          | no | Tiempo máximo de cada petición (`30s`). También limita la descarga de ficheros: súbelo si hay ficheros grandes. |
+| `MAX_DOWNLOAD_MB`          | no | Tamaño máximo de los ficheros que se descargan de Moodle (`50`). |
 | `MOODLE_MAX_CONCURRENCY`   | no | Peticiones simultáneas máximas hacia Moodle (`30`). |
 | `MOODLE_ATTEMPT_TIMEOUT`   | no | Tiempo máximo de cada intento contra Moodle (`15s`). |
 | `MOODLE_MAX_RETRIES`       | no | Reintentos extra, solo en operaciones idempotentes (`2`). |
@@ -247,17 +250,38 @@ X-Maya-User: 2
 - Las fechas son *timestamps* Unix en UTC.
 - Si Moodle no devuelve los datos de un usuario (borrado o no visible), `user` solo trae el `id`.
 - `files` es siempre una lista (vacía si no hay ficheros).
-- `file_url` no sirve sin un token. La descarga se hará a través del gateway (pendiente).
+- `file_url` no sirve sin un token. El fichero se descarga a través del gateway con `POST /v1/files/download`.
 - Errores propios: 400 `invalid_assignment` o `invalid_status`; 403 `moodle_forbidden` sin permiso sobre la tarea; 404 `not_found` si la tarea no existe.
 
 La usa `maya_moodle.moodlink.get_submissions()`, y con ella la sincronización de convalidaciones de `maya_valid`.
+
+### `POST /v1/files/download`
+
+Descarga un fichero de Moodle a partir de la `file_url` que devuelve otro endpoint (por ejemplo, los ficheros de una entrega). Requiere `API_KEY` y `X-Maya-User`. La URL va en el cuerpo, no en la query, para que no quede en los logs de los proxies.
+
+```http
+POST /v1/files/download
+Authorization: Bearer <API_KEY>
+X-Maya-User: 2
+Content-Type: application/json
+
+{ "file_url": "https://moodle/webservice/pluginfile.php/123/assignsubmission_file/submission_files/10/conv.zip" }
+```
+
+La respuesta **no es JSON**: es el fichero tal cual, con el `Content-Type` de Moodle. Los errores sí son JSON, como en el resto de la API.
+
+- Solo se aceptan URLs de `webservice/pluginfile.php` del Moodle configurado en `MOODLE_URL`. Cualquier otra URL se rechaza sin llamar a Moodle: si no, se podría enviar el token a otro servidor.
+- El token viaja en el cuerpo de la petición a Moodle, nunca en la URL.
+- El fichero se lee entero en memoria (como mucho `MAX_DOWNLOAD_MB`) antes de enviarlo. Así, si el token de una cuenta de servicio ha caducado, se renueva y se repite la descarga.
+- Errores propios: 400 `invalid_request` o `invalid_file_url`; 404 `not_found` si el fichero no existe; 413 `file_too_large`.
+
+La usa `maya_moodle.moodlink.download_file()`.
 
 ### Pendientes
 
 | Ruta | Estado |
 |------|--------|
 | `GET /v1/courses/{courseID}/students` | Comentada en `server.New`. Los tests de `internal/server` ya la usan y fallan con 404 hasta que se implemente. |
-| Descarga de ficheros de entregas | Siguiente fase de convalidaciones. |
 | Calificar, *feedback*, nuevo intento, prórrogas y bloqueo de entregas | Fases posteriores. Hay que confirmar que las funciones `mod_assign_*` están en el servicio web. |
 
 ### Añadir un endpoint
@@ -304,6 +328,72 @@ La usa `maya_moodle.moodlink.get_submissions()`, y con ella la sincronización d
    ```
 
    `go run ./cmd/gateway -healthcheck` consulta `/healthz` en local. Está pensado para el `HEALTHCHECK` de Docker, porque la imagen *distroless* no trae `curl`.
+
+### Con Docker (sin Go instalado)
+
+Hay dos formas de arrancarlo. En las dos, `compose.yaml` toma los valores del `.env` si existe y, si no, usa valores por defecto **solo de desarrollo** (`API_KEY`, `TOKEN_ENC_KEYS`, `MOODLE_URL`). `ODOO_DB_DSN` y `SERVICE_CREDENTIALS_FILE` no se toman del `.env`, porque allí apuntan a hosts y rutas de la máquina, no del contenedor.
+
+#### A. Solo (con un Postgres de desarrollo)
+
+Levanta el gateway y un Postgres desechable con una `res_users` mínima: `sql/dev/00-init.sh` crea la tabla con los mismos ids que Odoo (1 = `__system__`, 2 = `admin`, 3 = `profesor`) y aplica `sql/grants.sql`. Ese script solo se ejecuta la primera vez, con el volumen vacío.
+
+```bash
+docker compose up --build -d
+curl localhost:8080/readyz
+docker compose down -v           # parar y borrar la BD de desarrollo
+```
+
+#### B. Contra la BD del Odoo de odoodock
+
+`compose.odoodock.yaml` sustituye la BD de desarrollo por la de Odoo: el contenedor `odoodock-db-1` (red `traefik_network`), base de datos `odoo_db`, sin SSL. Se arranca solo el servicio `gateway`, para que no se levante el Postgres de desarrollo.
+
+Preparación (**una sola vez**). Antes tiene que estar instalado en Odoo el módulo que añade `moodle_username` y `moodle_token_enc` a `res_users`:
+
+```bash
+# 1. Contraseña del rol, en el .env (que no se versiona)
+printf '\nODOODOCK_DB_PASSWORD=%s\n' "$(openssl rand -hex 24)" >> .env
+
+# 2. Rol moodle_gateway con SELECT solo sobre las 4 columnas
+docker exec -i odoodock-db-1 psql -v ON_ERROR_STOP=1 -U odoodock -d odoo_db \
+  -v gateway_password="$(grep '^ODOODOCK_DB_PASSWORD=' .env | cut -d= -f2)" -f - < sql/grants.sql
+```
+
+`grants.sql` no se puede volver a ejecutar entero: el `CREATE ROLE` falla si el rol ya existe. Para cambiar la contraseña: `ALTER ROLE moodle_gateway PASSWORD '…'`.
+
+Arranque:
+
+```bash
+docker compose -f compose.yaml -f compose.odoodock.yaml up --build -d gateway
+curl localhost:8080/readyz
+docker compose -f compose.yaml -f compose.odoodock.yaml down
+```
+
+Para no escribir los dos `-f`, añade `COMPOSE_FILE=compose.yaml:compose.odoodock.yaml` al `.env` y usa `docker compose up -d gateway`.
+
+#### Dirección del gateway
+
+| Desde                                              | URL                                    |
+|----------------------------------------------------|----------------------------------------|
+| La máquina anfitriona (curl, Bruno, navegador)     | `http://localhost:8080`                |
+| Otro contenedor de `traefik_network` (Odoo, n8n…)  | `http://maya-moodlink-gateway-1:8080`  |
+
+* Si el 8080 de la máquina está ocupado, se cambia el puerto publicado con `GATEWAY_PORT=18080` (en el `.env` o delante del comando) y la URL pasa a ser `http://localhost:18080`. Dentro de la red de Docker sigue siendo `:8080`.
+* `maya-moodlink-gateway-1` solo se resuelve desde `traefik_network`, es decir, en la opción B. En la opción A el gateway solo está en la red propia del compose.
+* Todas las rutas `/v1/...` exigen `Authorization: Bearer <API_KEY>`; `/healthz` y `/readyz` no.
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" -H "X-Maya-User: 2" localhost:8080/v1/assignments/123/submissions
+```
+
+#### Tests e imagen
+
+```bash
+docker build --target test .     # go vet + go test -race dentro de la imagen de Go
+```
+
+* `Dockerfile`: compilación en `golang:1.25` y binario estático en `gcr.io/distroless/static-debian12:nonroot` (sin shell; el `HEALTHCHECK` usa `/gateway -healthcheck`).
+* `sql/grants.sql` crea el rol `moodle_gateway` con `SELECT` solo sobre `id, active, moodle_username, moodle_token_enc`. En producción lo ejecuta a mano, una vez, el propietario de la BD de Odoo: `psql -d <bd> -v gateway_password='...' -f sql/grants.sql`.
+* Cuentas de servicio: copia `secrets/service_credentials.example.json` a `secrets/service_credentials.json` con las contraseñas reales, pon `SERVICE_CREDENTIALS_FILE: /run/secrets/service_credentials` en `compose.yaml` y descomenta los bloques `secrets:`.
 
 ### Estructura
 
